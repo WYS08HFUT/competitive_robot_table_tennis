@@ -22,3 +22,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+runs/
+.pytest_cache
+.codex
+.agents
+outputs
