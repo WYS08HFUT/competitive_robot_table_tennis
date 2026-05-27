@@ -1,756 +1,390 @@
-Below is the refactor blueprint I would use for your current single-paddle receive task.
-
-The core change is:
-
-```text
-Current design:
-  PPO policy directly learns paddle motion from reward shaping.
-
-Refactored design:
-  trajectory predictor → impact planner → path planner → residual RL policy → paddle actuator target.
-```
-
-The goal is to stop using reward as the main “teacher” for where/how to hit. The planner should provide the nominal stroke. RL should only learn residual corrections that improve robustness and contact quality.
-
-Your current task already has a learned 6-DoF direct-paddle policy with delta-pose action, observation containing ball state/paddle state/predicted intercept/predicted landing/rule flags, and event rewards for legal hit, forward speed, lift, cross-net, and landing.  The refactor should keep the useful parts, but move the gross decision-making out of PPO.
-
-## 1. Target architecture
-
-Use this module layout:
-
-```text
-single_paddle_receive/
-  env.py
-  env_cfg.py
-  control.py
-
-  mdp/
-    observations.py
-    rewards.py
-    terminations.py
-    events.py
-    transforms.py
-
-  planning/
-    ball_predictor.py
-    impact_planner.py
-    paddle_path_planner.py
-    planner_types.py
-
-  policy/
-    residual_policy.py   # optional later, if separated from generic PPO policy
-
-  assets/
-    single_paddle_receive_dataset_frame.xml
-```
-
-Main data flow per control step:
-
-```text
-ball state, paddle state
-        ↓
-BallPredictor
-        ↓
-predicted trajectory
-        ↓
-ImpactPlanner
-        ↓
-planned hit time / hit pose / outgoing velocity / target landing
-        ↓
-PaddlePathPlanner
-        ↓
-nominal paddle command at current time
-        ↓
-RL residual action
-        ↓
-final paddle command = nominal command + residual
-        ↓
-MuJoCo actuator target
-```
-
-## 2. Phase 1: make the planner-only baseline work
-
-Before training PPO, create a no-learning baseline. This is the most important refactor step.
-
-Add config:
-
-```python
-@dataclass
-class PlannerCfg:
-    enabled: bool = True
-    mode: str = "analytic"  # analytic first, neural later
-    target_landing_x_range: tuple[float, float] = (-0.35, 0.35)
-    target_landing_y_range: tuple[float, float] = (0.45, 1.05)
-    hit_time_min: float = 0.12
-    hit_time_max: float = 0.75
-    hit_time_samples: int = 64
-    min_hit_z: float = 0.25
-    max_hit_z: float = 1.30
-    receive_side_y: float = -0.90
-    follow_through_time: float = 0.15
-```
-
-Add `planning/planner_types.py`:
-
-```python
-from dataclasses import dataclass
-import numpy as np
-
-@dataclass
-class BallTrajectoryPoint:
-    t: float
-    pos: np.ndarray
-    vel: np.ndarray
-
-@dataclass
-class HitPlan:
-    valid: bool
-    hit_time: float
-    hit_pos: np.ndarray
-    hit_euler: np.ndarray
-    hit_vel: np.ndarray
-    outgoing_vel_des: np.ndarray
-    target_landing_xy: np.ndarray
-    cost: float
-```
-
-Add `planning/ball_predictor.py`:
-
-```python
-class BallPredictor:
-    def __init__(self, gravity=-9.81):
-        self.g = np.array([0.0, 0.0, gravity], dtype=np.float32)
-
-    def predict(self, pos, vel, times):
-        points = []
-        for t in times:
-            p = pos + vel * t + 0.5 * self.g * (t * t)
-            v = vel + self.g * t
-            points.append((float(t), p, v))
-        return points
-```
-
-Start with gravity-only. Do not add a neural predictor yet. Later, add drag/spin correction.
-
-## 3. Phase 2: implement analytic impact planner
-
-Add `planning/impact_planner.py`.
-
-The planner should search feasible hit times and choose a reachable paddle pose.
-
-Pseudo-code:
-
-```python
-class ImpactPlanner:
-    def __init__(self, cfg, table_cfg, workspace_cfg):
-        self.cfg = cfg
-        self.table = table_cfg
-        self.workspace = workspace_cfg
-
-    def plan(self, ball_pos, ball_vel, paddle_pos, paddle_euler):
-        target_xy = self.sample_or_set_target_landing()
-        times = np.linspace(
-            self.cfg.hit_time_min,
-            self.cfg.hit_time_max,
-            self.cfg.hit_time_samples,
-        )
-
-        best = None
-        for t in times:
-            p_hit, v_in = predict_ball_state(ball_pos, ball_vel, t)
-
-            if not self.inside_workspace(p_hit):
-                continue
-            if p_hit[2] < self.cfg.min_hit_z or p_hit[2] > self.cfg.max_hit_z:
-                continue
-
-            v_out_des = self.solve_outgoing_velocity(
-                start=p_hit,
-                target_xy=target_xy,
-                target_z=self.table.surface_z,
-                flight_time=0.45,
-            )
-
-            hit_euler = self.estimate_paddle_orientation(v_in, v_out_des)
-            hit_vel = self.estimate_paddle_velocity(v_in, v_out_des)
-
-            cost = self.plan_cost(
-                paddle_pos=paddle_pos,
-                paddle_euler=paddle_euler,
-                hit_pos=p_hit,
-                hit_euler=hit_euler,
-                hit_time=t,
-            )
-
-            if best is None or cost < best.cost:
-                best = HitPlan(
-                    valid=True,
-                    hit_time=t,
-                    hit_pos=p_hit,
-                    hit_euler=hit_euler,
-                    hit_vel=hit_vel,
-                    outgoing_vel_des=v_out_des,
-                    target_landing_xy=target_xy,
-                    cost=cost,
-                )
-
-        if best is None:
-            return HitPlan(valid=False, ...)
-        return best
-```
-
-For outgoing velocity, use a ballistic solve. If the opponent target is `(x_target, y_target, z_table)`, and the hit point is `p_hit`, choose a flight time `T` and solve:
-
-```python
-v_out = (target_pos - p_hit - 0.5 * g * T**2) / T
-```
-
-At first, set `T` in `0.35–0.60 s` and reject impossible speeds.
-
-For paddle orientation, approximate the paddle normal from incoming/outgoing velocity:
-
-```python
-n = normalize(v_out_des - v_in)
-```
-
-Then convert normal to yaw/pitch/roll. Keep this approximate. The residual policy can correct it.
-
-## 4. Phase 3: add paddle path planner
-
-Add `planning/paddle_path_planner.py`.
-
-The path planner should produce a smooth nominal paddle command. Use minimum-jerk interpolation.
-
-```python
-def smoothstep5(tau):
-    tau = np.clip(tau, 0.0, 1.0)
-    return 10*tau**3 - 15*tau**4 + 6*tau**5
-```
-
-Command generation:
-
-```python
-class PaddlePathPlanner:
-    def reset(self, current_pose, hit_plan, now):
-        self.start_pose = current_pose
-        self.hit_plan = hit_plan
-        self.start_time = now
-
-    def command(self, now):
-        if not self.hit_plan.valid:
-            return self.safe_ready_pose()
-
-        tau = (now - self.start_time) / max(self.hit_plan.hit_time, 1e-3)
-        s = smoothstep5(tau)
-
-        pos_cmd = (1 - s) * self.start_pose.pos + s * self.hit_plan.hit_pos
-        euler_cmd = interpolate_euler(self.start_pose.euler, self.hit_plan.hit_euler, s)
-
-        return PaddleCommand(pos=pos_cmd, euler=euler_cmd)
-```
-
-After contact, follow through:
-
-```text
-continue 0.10–0.20 s along desired outgoing direction,
-then reset to ready pose.
-```
-
-## 5. Phase 4: change action semantics
-
-Current action is full delta-pose control. Refactor it to residual control.
-
-Old:
-
-```python
-cmd_pose = previous_cmd_pose + action_scaled_delta
-```
-
-New:
-
-```python
-nominal_cmd = path_planner.command(t)
-residual = scale_action(action)
-cmd_pose = nominal_cmd + residual
-cmd_pose = clip_to_workspace(cmd_pose)
-```
-
-Recommended residual limits:
-
-```python
-residual_limits = {
-    "x": 0.08,
-    "y": 0.08,
-    "z": 0.08,
-    "roll": 0.25,
-    "pitch": 0.25,
-    "yaw": 0.25,
-}
-```
-
-This keeps PPO from becoming the planner.
-
-Also add a mode switch:
-
-```python
-control_mode: Literal[
-    "direct_delta",        # current behavior
-    "planner_only",        # no RL residual
-    "planner_residual",    # recommended
-]
-```
-
-This lets you compare cleanly.
-
-## 6. Phase 5: observation redesign
-
-Current observation already includes ball state, paddle state, predicted intercept/landing, rule flags, and previous action.  Add planner outputs explicitly.
-
-Recommended observation:
-
-```python
-obs = [
-    # ball
-    ball_pos,
-    ball_vel,
-    ball_ang_vel,
-
-    # paddle actual
-    paddle_pos,
-    paddle_euler,
-    paddle_lin_vel,
-    paddle_ang_vel,
-
-    # planner
-    planned_hit_pos - paddle_pos,
-    planned_hit_euler,
-    planned_hit_time_remaining,
-    planned_cmd_pos - paddle_pos,
-    planned_cmd_euler,
-    planned_outgoing_vel,
-    target_landing_xy,
-
-    # phase / rule state
-    has_hit,
-    own_side_bounce_count,
-    paddle_hit_count,
-    crossed_net,
-    planner_valid,
-
-    # previous action
-    prev_action,
-]
-```
-
-Normalize everything.
-
-Important normalizations:
-
-```text
-position: divide by table length or workspace radius
-velocity: divide by 5.0 m/s
-angular velocity: divide by 30 rad/s
-time_to_hit: divide by 1.0 s
-angles: divide by pi
-```
+# Single Paddle Receive RL Training Blueprint
 
-## 7. Phase 6: reward redesign
+This file is now the active training blueprint for the current structure.
+It keeps the work already completed and reorganizes the remaining stages around
+the RL policy, not around more planner refactoring.
 
-The new reward should evaluate the outcome. It should not teach the full movement.
+## Current Structure
 
-### Pre-hit rewards: small tracking only
-
-```python
-r_pre = 0.0
+The environment currently works like this:
 
-if not has_hit and planner_valid:
-    r_pre += 0.10 * exp(-norm(paddle_pos - planned_cmd_pos) / 0.08)
-    r_pre += 0.05 * exp(-orientation_error(paddle_rot, planned_cmd_rot) / 0.25)
-    r_pre += 0.05 * exp(-norm(paddle_vel - planned_cmd_vel) / 1.0)
-```
+- `BallPredictor` predicts reachable future ball states.
+- `ImpactPlanner` chooses a nominal hit target.
+- `PaddlePathPlanner` produces a nominal paddle command.
+- In `planner_residual` mode, the policy adds a residual action every control
+  step from serve start onward.
 
-Remove or reduce:
+So the policy already acts throughout the episode.
+What still makes the planner dominant is:
 
-```text
-survive: 0 or +0.001
-intercept: replace with planner tracking
-align: replace with planner orientation tracking
-```
+- planner-tracking reward,
+- planner-heavy observations,
+- full nominal command assistance.
 
-### Contact reward
+## What Is Already Done
 
-```python
-if first_legal_hit:
-    r += 3.0
+### Planner stack
 
-    v_out = ball_vel_after_hit
+- [x] `BallPredictor` implemented
+- [x] `ImpactPlanner` implemented
+- [x] `PaddlePathPlanner` implemented
+- [x] `planner_only` / `planner_residual` control modes implemented
 
-    # direction to target
-    desired_dir = normalize(target_landing_3d - ball_pos_after_hit)
-    actual_dir = normalize(v_out)
-    r += 2.0 * clip(dot(desired_dir, actual_dir), 0.0, 1.0)
+### Planner-only validation
 
-    # forward speed
-    r += 1.0 * clip((v_out[1] - 0.8) / 2.5, 0.0, 1.0)
+- [x] headless planner-only batch evaluator added
+- [x] planner-only pytest coverage added
+- [x] planner-only contact gate defined
+- [x] planner-only contact gate checked in the `mujoco` conda env
 
-    # lift
-    r += 0.5 * clip((v_out[2] - 0.2) / 1.2, 0.0, 1.0)
-```
+Artifacts:
 
-### Net reward
+- `tests/planner_only_eval.py`
+- `tests/test_planner_only_validation.py`
 
-```python
-if crossed_net_above_height:
-    r += 4.0
+Current result:
 
-if net_fail:
-    r -= 5.0
-    done = True
-```
+- planner-only is good enough for stable contact on the easy bucket,
+- planner-only is not yet good at cross-net return,
+- that is acceptable under the current task split.
 
-### Landing reward
+## Current Task Split
 
-```python
-if legal_opponent_landing:
-    r += 15.0
-    err = norm(actual_landing_xy - target_landing_xy)
-    r += 3.0 * exp(-err / 0.25)
-    success = True
-    done = True
-```
+Current intended division of labor:
 
-### Failure penalties
+- Planner:
+  - get the paddle to a sensible hittable target,
+  - make contact likely,
+  - provide a useful prior.
+- Policy:
+  - tune the hit,
+  - turn contact into cross-net return,
+  - later improve landing quality,
+  - eventually learn with less planner help.
 
-Use stronger penalties than now:
+This means the next work is primarily:
 
-```python
-double_bounce: -6.0
-multi_hit: -4.0
-net_fail: -5.0
-wrong_landing: -6.0
-floor: -6.0
-out_of_bounds: -6.0
-planner_invalid_timeout: -2.0
-```
+1. reward redesign,
+2. training diagnostics,
+3. staged fade-out of planner dependence.
 
-### Regularization
+## Core Decision Locked In
 
-Keep it weak early:
+Planner-tracking reward should be removed first.
 
-```python
-r -= 0.001 * sum(action**2)
-r -= 0.002 * sum((action - prev_action)**2)
-r -= 0.0001 * sum(paddle_qvel**2)
-```
+Reason:
 
-Increase later only if the policy becomes too violent.
+- the policy already acts from serve start,
+- but current planner-tracking reward still pays it to obey the nominal plan up
+  to contact,
+- that conflicts with the goal that the policy should own the hit tuning.
 
-## 8. Phase 7: curriculum
+So the fade-out order will be:
 
-Use this sequence.
+1. remove planner-tracking reward first,
+2. later reduce planner observation dependence,
+3. only after that reduce control assistance.
 
-### Stage 0: planner-only sanity
+## Reward Audit For The Current Structure
 
-No RL. Run analytic predictor + impact planner + path planner.
+### Keep and strengthen for current Stage 1
 
-Required before PPO:
+- `legal_hit`
+  - purpose: preserve interception and contact
+  - recommendation: keep medium-strong
+  - recommended weight: `2.5`
 
-```text
-legal_hit_rate > 50%
-cross_net_rate > 10–20%
-bounce model stable
-no repeated energy gain
-```
+- `cross_net`
+  - purpose: main Stage 1 neural objective
+  - recommendation: keep strongest
+  - recommended weight: `5.0`
 
-If planner-only cannot hit, do not train PPO yet.
+### Keep but weaken a lot
+
+- `send_forward`
+  - purpose: weak post-contact shaping
+  - recommendation: keep weak
+  - recommended weight: `0.30`
+
+- `lift`
+  - purpose: weak anti-net shaping
+  - recommendation: keep weak
+  - recommended weight: `0.10`
+
+- `action_rate_penalty`
+  - purpose: mild smoothing only
+  - recommendation: keep tiny
+  - recommended weight: `0.001`
+
+- `action_mag_penalty`
+  - purpose: tiny regularization only
+  - recommendation: keep tiny
+  - recommended weight: `0.0005`
+
+### Keep but secondary for Stage 1
+
+- `landing`
+  - purpose: later return-quality objective
+  - recommendation: keep smaller than `cross_net`
+  - recommended weight: `2.0`
+
+### Disable first
+
+- `survive`
+  - recommendation: disable
+  - recommended weight: `0.0`
+
+- `tracking_pos`
+  - recommendation: disable first
+  - reason: planner-tracking reward is the first dependence to remove
+  - recommended weight: `0.0`
+
+- `tracking_rot`
+  - recommendation: disable first
+  - recommended weight: `0.0`
+
+- `tracking_vel`
+  - recommendation: disable
+  - recommended weight: `0.0`
 
-### Stage 1: synthetic easy balls
+- `landing_shape`
+  - recommendation: disable for early RL training
+  - recommended weight: `0.0`
 
-Use simple ball states, not full `serves.json`.
+- `qvel_penalty`
+  - recommendation: disable first
+  - recommended weight: `0.0`
 
-```text
-speed: 0.8–1.8 m/s
-spin: zero
-lateral spread: small
-height: reachable
-```
+### Keep failure penalties
 
-Reward: first hit + direction + cross-net.
+- `floor_penalty`
+  - keep
+  - recommended weight: `-2.0`
 
-### Stage 2: filtered serves.json
+- `double_bounce_penalty`
+  - keep
+  - recommended weight: `-2.0`
 
-Filter by reachability and speed.
+- `multi_hit_penalty`
+  - keep
+  - recommended weight: `-2.0`
 
-```text
-speed < 3.0 m/s
-hit candidate exists in [0.15, 0.75] s
-predicted hit z in [0.35, 1.20]
-```
+- `wrong_landing_penalty`
+  - keep, but softer in early Stage 1
+  - recommended weight: `-1.0`
 
-### Stage 3: harder serves
+- `net_fail_penalty`
+  - keep and make meaningful
+  - recommended weight: `-3.0`
 
-Increase speed, lateral spread, spin/noise.
+- `out_of_bounds_penalty`
+  - keep
+  - recommended weight: `-2.0`
 
-### Stage 4: legal receive
+## Immediate TODO
 
-Enable bounce-before-hit requirement.
+### A. Reward redesign for Stage 1 RL
 
-```python
-require_bounce_before_hit = True
-```
+- [ ] In `mdp/rewards.py`, disable:
+  - `survive`
+  - `tracking_pos`
+  - `tracking_rot`
+  - `tracking_vel`
+  - `landing_shape`
+  - `qvel_penalty`
+- [ ] Reweight:
+  - `legal_hit -> 2.5`
+  - `send_forward -> 0.30`
+  - `lift -> 0.10`
+  - `cross_net -> 5.0`
+  - `landing -> 2.0`
+  - `action_rate_penalty -> 0.001`
+  - `action_mag_penalty -> 0.0005`
+  - `floor_penalty -> -2.0`
+  - `double_bounce_penalty -> -2.0`
+  - `multi_hit_penalty -> -2.0`
+  - `wrong_landing_penalty -> -1.0`
+  - `net_fail_penalty -> -3.0`
+  - `out_of_bounds_penalty -> -2.0`
+- [ ] Keep `send_forward` and `lift` only as weak shaping, not main objectives.
 
-Do this only after the policy can reliably return.
+### B. Add RL-focused diagnostics
 
-### Stage 5: OpenArm transfer
+- [ ] Add to runtime state / `info`:
+  - cross-net success flag
+  - first-hit ball speed after contact
+  - first-hit outgoing direction quality
+  - landing error when available
+  - terminal reason breakdown
+- [ ] Log these in `agents/mjlab/train.py`:
+  - legal-hit rate
+  - cross-net rate
+  - opponent-landing rate
+  - net-fail rate
+  - wrong-landing rate
+  - out-of-bounds rate
 
-Use the virtual paddle planner output as:
+### C. Start Stage 1 PPO on easy bucket
 
-```text
-desired end-effector/paddle trajectory
-```
+- [ ] Train only on `easy`
+- [ ] Judge progress using event rates, not total return alone
+- [ ] Do not touch planner logic first unless contact quality degrades
 
-Then train OpenArm to track it with IK/RL residual.
+## Reorganized Training Stages
 
-## 9. Event logging required after refactor
+### Stage 0: Planner Contact Baseline
 
-Add these logs. Without them, debugging will still be vague.
+Goal:
 
-```text
-planner/valid_rate
-planner/hit_time_mean
-planner/hit_time_std
-planner/hit_pos_error_at_contact
-planner/nominal_success_rate
+- verify nominal planner can create stable contact.
 
-episode_events/legal_hit_rate
-episode_events/cross_net_rate
-episode_events/opponent_landing_rate
-episode_events/net_fail_rate
-episode_events/wrong_landing_rate
-episode_events/floor_rate
-episode_events/out_of_bounds_rate
-episode_events/double_bounce_rate
-episode_events/multi_hit_rate
+Current status:
 
-contact/ball_speed_before_hit
-contact/ball_speed_after_hit
-contact/outgoing_direction_score
-contact/landing_error
-contact/paddle_speed_at_hit
-```
+- done.
 
-These should be logged per episode and rolling mean.
+Gate:
 
-## 10. Refactor order by file
+- planner-only contact gate passes on easy bucket.
 
-### `env_cfg.py`
+### Stage 1: Policy Learns Cross-Net Return
 
-Add:
+Goal:
 
-```python
-control_mode = "planner_residual"
-sim_dt = 0.001
-control_decimation = 10
+- keep planner as contact prior,
+- remove planner-tracking reward,
+- train policy to convert contact into cross-net return.
 
-planner_cfg = PlannerCfg(...)
-reward_cfg = RewardCfg(...)
-curriculum_cfg = CurriculumCfg(...)
-```
+Reward emphasis:
 
-Move reward weights into named groups:
+- strong `legal_hit`
+- strongest `cross_net`
+- weak `send_forward`
+- weak `lift`
+- smaller `landing`
+- no planner-tracking reward
 
-```python
-RewardCfg(
-    tracking_pos=0.10,
-    tracking_rot=0.05,
-    tracking_vel=0.05,
-    legal_hit=3.0,
-    outgoing_direction=2.0,
-    outgoing_forward=1.0,
-    outgoing_lift=0.5,
-    cross_net=4.0,
-    landing=15.0,
-    landing_accuracy=3.0,
-    ...
-)
-```
+Planner dependence:
 
-### `env.py`
+- control assistance: full
+- planner observations: full
+- planner reward: removed
 
-Add planner state:
+Recommended promotion criteria:
 
-```python
-self.ball_predictor
-self.impact_planner
-self.path_planner
-self.current_hit_plan
-self.current_nominal_cmd
-self.target_landing_xy
-```
+- legal-hit rate stays healthy
+- cross-net rate becomes clearly nontrivial
+- net-fail becomes less dominant
 
-At reset:
+### Stage 2: Policy Improves Landing After Cross-Net Exists
 
-```python
-sample ball state
-sample target landing
-compute initial hit plan
-reset path planner
-```
+Goal:
 
-At each control step:
+- once cross-net behavior exists, improve opponent-side landing quality.
 
-```python
-update ball prediction
-if not has_hit:
-    update or keep hit plan
-nominal_cmd = path_planner.command(time)
-final_cmd = control.apply_residual(nominal_cmd, action)
-step simulation
-detect events
-compute reward
-```
+Reward changes:
 
-### `control.py`
+- keep `cross_net` strong
+- increase `landing`
+- optionally reintroduce a very weak landing-shape-like term only if it helps
+  and does not create model bias
 
-Change from direct delta to modes:
+Planner dependence:
 
-```python
-def action_to_command(action, mode, nominal_cmd, prev_cmd):
-    if mode == "direct_delta":
-        return prev_cmd + scale_delta(action)
-    if mode == "planner_only":
-        return nominal_cmd
-    if mode == "planner_residual":
-        return nominal_cmd + scale_residual(action)
-```
+- control assistance: still full
+- planner observations: still present
+- planner reward: still absent
 
-### `observations.py`
+Recommended promotion criteria:
 
-Add planner fields.
+- stable cross-net rate
+- opponent-landing rate becomes nontrivial
+- wrong-landing begins to drop
 
-Do not just add everything raw; add normalized relative quantities:
+### Stage 3: Reduce Planner Observation Dependence
 
-```python
-planned_hit_pos_rel = planned_hit_pos - paddle_pos
-planned_cmd_pos_rel = planned_cmd_pos - paddle_pos
-target_landing_xy
-time_to_hit
-planner_valid
-```
+Goal:
 
-### `rewards.py`
+- make the policy rely less on planner hints and more on raw game state.
 
-Remove old intercept/align as primary terms.
+Changes:
 
-Replace with:
+- apply planner observation dropout or masking on some episodes
+- keep planner residual control assistance unchanged at first
 
-```python
-tracking_reward()
-contact_outcome_reward()
-post_hit_prediction_reward()
-regularization_reward()
-```
+Recommendation:
 
-Keep event rewards in `env.py` or move event reward computation to `events.py`.
+- do not do this until Stage 2 is stable
 
-### `events.py`
+### Stage 4: Reduce Control Assistance
 
-Create this if you do not already have it.
+Goal:
 
-Responsibilities:
+- let the policy increasingly own the whole stroke from serve start.
 
-```text
-detect first paddle contact
-detect table bounce side
-detect net crossing
-detect net fail
-detect floor/out-of-bounds
-classify terminal reason
-```
+Changes:
 
-This avoids mixing rule logic with PPO/reward code.
+- reduce nominal command dominance gradually
+- optionally shrink residual-vs-nominal coupling over curriculum
 
-## 11. Acceptance criteria
+Recommendation:
 
-Do not proceed to the next stage unless the current stage passes.
+- this should be the last fade-out step, not the first
 
-### Physics/contact acceptance
+### Stage 5: Planner Optional / Distillation Stage
 
-```text
-Drop test: bounce height decays.
-Scripted paddle hit: same initial state gives same outcome.
-No random energy injection.
-```
+Goal:
 
-### Planner-only acceptance
+- support a future version where the policy can play with minimal planner help.
 
-```text
-legal_hit_rate > 50%
-cross_net_rate > 10–20%
-out_of_bounds not dominant from planner itself
-```
+Possible methods:
 
-### RL residual Stage 1 acceptance
+- planner dropout on full episodes
+- teacher-student transfer
+- mixed planner-assisted and planner-light curriculum
 
-```text
-legal_hit_rate > 70%
-cross_net_rate > 40%
-success_rate > 15%
-```
+This is a future goal, not an immediate task.
 
-### RL residual Stage 2 acceptance
+## File-Level Priorities
 
-```text
-success_rate > 30% on filtered serves.json
-wrong_landing and floor are no longer dominant
-```
+### First priority
 
-## 12. Minimal implementation sequence
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/env_cfg.py`
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/mdp/rewards.py`
 
-Do not implement neural planner first. Use this order:
+Reason:
 
-```text
-1. Fix MJCF/contact timestep to stable 0.001.
-2. Add BallPredictor.
-3. Add ImpactPlanner.
-4. Add PaddlePathPlanner.
-5. Add planner_only mode.
-6. Verify planner-only behavior.
-7. Add planner_residual action mode.
-8. Add planner fields to observation.
-9. Replace reward with planner-tracking + ball-outcome reward.
-10. Train PPO residual on easy synthetic serves.
-11. Move to filtered serves.json.
-12. Only then consider a neural impact planner.
-```
+- reward weights and enabled terms should be aligned first.
 
-## 13. Final recommendation
+### Second priority
 
-Do not refactor toward a “bigger neural policy” yet. Refactor toward a **structured controller with residual learning**.
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/env.py`
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/mdp/events.py`
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/agents/mjlab/train.py`
 
-The final task should be:
+Reason:
 
-```text
-Analytic modules:
-  predict ball trajectory
-  choose impact target
-  generate paddle path
+- we need RL-facing diagnostics before judging training.
 
-RL module:
-  correct impact pose/timing/contact angle
+### Lower priority for now
 
-Reward:
-  score ball outcome, not paddle-chasing behavior
-```
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/planning/paddle_path_planner.py`
+- `competitive_robot_table_tennis_rl/tasks/manager_based/single_paddle_receive/planning/impact_planner.py`
 
-This gives you much lower debug cost because every failure becomes localized:
+Reason:
 
-```text
-misses ball       → planner/path/control issue
-hits but net fail → outgoing velocity/orientation issue
-crosses but out   → landing planner/contact issue
-unstable result   → contact physics issue
-poor residual     → RL/reward issue
-```
+- only revisit these if RL runs show contact instability, planner thrash, or a
+  regression in legal-hit rate.
 
-That is the refactor path I would use.
+## Practical Answer
+
+Current focus should be:
+
+- not more planner ambition,
+- not more planner reward,
+- but better RL reward and better RL diagnostics.
+
+The next safe big change is:
+
+- remove planner-tracking reward first,
+- then train the policy to own cross-net return while planner still provides
+  contact assistance.

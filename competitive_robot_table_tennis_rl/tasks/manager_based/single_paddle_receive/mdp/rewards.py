@@ -20,6 +20,7 @@ def dense_reward(
     *,
     reward_cfg: RewardCfg,
     runtime_state: RuntimeState,
+    ball_vel: np.ndarray,
     paddle_qpos: np.ndarray,
     paddle_qvel: np.ndarray,
     predicted_landing: np.ndarray | None,
@@ -34,6 +35,7 @@ def dense_reward(
         "tracking_pos": 0.0,
         "tracking_rot": 0.0,
         "tracking_vel": 0.0,
+        "outgoing_direction": 0.0,
         "landing_shape": 0.0,
         "action_rate_penalty": -reward_cfg.action_rate_penalty * float(np.sum((action - prev_action) ** 2)),
         "action_mag_penalty": -reward_cfg.action_mag_penalty * float(np.sum(action**2)),
@@ -52,6 +54,16 @@ def dense_reward(
         reward["tracking_pos"] = reward_cfg.tracking_pos * float(np.exp(-pos_err / reward_cfg.tracking_pos_sigma_m))
         reward["tracking_rot"] = reward_cfg.tracking_rot * float(np.exp(-rot_err / reward_cfg.tracking_rot_sigma_rad))
         reward["tracking_vel"] = reward_cfg.tracking_vel * float(np.exp(-vel_err / reward_cfg.tracking_vel_sigma_m_s))
+
+    if (
+        runtime_state.has_hit
+        and not runtime_state.crossed_net_after_hit
+        and runtime_state.planned_outgoing_vel is not None
+    ):
+        desired_dir = normalize(runtime_state.planned_outgoing_vel)
+        actual_dir = normalize(ball_vel)
+        direction_score = float(np.clip(np.dot(desired_dir, actual_dir), 0.0, 1.0))
+        reward["outgoing_direction"] = reward_cfg.outgoing_direction * direction_score
 
     if runtime_state.has_hit and predicted_landing is not None and target_landing_xy is not None:
         err = float(np.linalg.norm(predicted_landing[:2] - target_landing_xy[:2]))

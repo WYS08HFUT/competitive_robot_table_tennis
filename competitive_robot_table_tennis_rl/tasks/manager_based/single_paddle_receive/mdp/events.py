@@ -21,10 +21,14 @@ class ContactState:
 @dataclass
 class RuntimeState:
     has_hit: bool = False
+    legal_hit: bool = False
     paddle_hit_count: int = 0
     own_side_bounce_count: int = 0
     crossed_net_after_hit: bool = False
     net_contact_after_hit: bool = False
+    outgoing_direction_score: float = 0.0
+    first_hit_ball_speed_m_s: float = 0.0
+    landing_error_m: float = 0.0
     predicted_intercept: np.ndarray | None = None
     predicted_landing: np.ndarray | None = None
     planner_valid: bool = False

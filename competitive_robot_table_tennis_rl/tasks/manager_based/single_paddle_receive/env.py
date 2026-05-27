@@ -26,6 +26,7 @@ from .mdp.rewards import dense_reward, penalty, reward_for_cross_net, reward_for
 from .mdp.terminations import terminal_from_state
 from .mdp.transforms import (
     compute_intercept_point_at_y,
+    normalize,
     paddle_normal_from_xmat,
     point_in_table_bounds,
     point_on_opponent_side,
@@ -488,6 +489,12 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
                 )
             else:
                 self.state.has_hit = True
+                self.state.legal_hit = True
+                self.state.first_hit_ball_speed_m_s = float(np.linalg.norm(self.ball_vel))
+                if self.state.planned_outgoing_vel is not None:
+                    desired_dir = normalize(self.state.planned_outgoing_vel)
+                    actual_dir = normalize(self.ball_vel)
+                    self.state.outgoing_direction_score = float(np.clip(np.dot(desired_dir, actual_dir), 0.0, 1.0))
                 rewards = self._merge_rewards(rewards, reward_for_legal_hit(self.cfg.reward, self.ball_vel))
 
         if self.state.has_hit and not self.state.crossed_net_after_hit:
@@ -512,6 +519,7 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
             )
 
         if self.state.has_hit and new_table_contact:
+            self.state.landing_error_m = float(np.linalg.norm(self.ball_pos[:2] - self.target_landing_xy[:2]))
             if point_on_opponent_side(self.ball_pos[1]) and point_in_table_bounds(float(self.ball_pos[0]), float(self.ball_pos[1])):
                 self.state.success = True
                 rewards = self._merge_rewards(rewards, reward_for_success(self.cfg.reward))
@@ -535,6 +543,7 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
         return dense_reward(
             reward_cfg=self.cfg.reward,
             runtime_state=self.state,
+            ball_vel=self.ball_vel,
             paddle_qpos=self.paddle_qpos,
             paddle_qvel=self.paddle_qvel,
             predicted_landing=self.state.predicted_landing,
@@ -567,6 +576,7 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
         )
 
     def _build_info(self, episode_success: bool) -> dict[str, Any]:
+        terminal_reason = "success" if episode_success else self.state.failure_reason
         return {
             "task_id": self.cfg.task_id,
             "task_mode": self.cfg.task_mode,
@@ -577,6 +587,18 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
             "serve_id": self.current_serve.id if self.current_serve is not None else None,
             "episode_success": episode_success,
             "planner_valid": self.state.planner_valid,
+            "legal_hit": self.state.legal_hit,
+            "cross_net": self.state.crossed_net_after_hit,
+            "opponent_landing": self.state.success,
+            "first_hit_ball_speed_m_s": self.state.first_hit_ball_speed_m_s,
+            "outgoing_direction_score": self.state.outgoing_direction_score,
+            "landing_error_m": self.state.landing_error_m,
+            "event_double_bounce": terminal_reason == "double_bounce",
+            "event_multi_hit": terminal_reason == "multi_hit",
+            "event_net_fail": terminal_reason == "net_fail",
+            "event_wrong_landing": terminal_reason == "wrong_landing",
+            "event_floor": terminal_reason == "ball_floor",
+            "event_out_of_bounds": terminal_reason == "ball_out_of_bounds",
             "target_landing_xy": self.target_landing_xy.copy(),
             "physics_timestep_s": self.physics_timestep_s,
             "control_timestep_s": self.control_timestep_s,

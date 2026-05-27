@@ -107,6 +107,12 @@ def _rolling_terminal_reason_rates(reasons: deque[str]) -> dict[str, float]:
     return {key: value / total for key, value in counts.items()}
 
 
+def _suffix_keys(values: dict[str, float], suffix: str) -> dict[str, float]:
+    """Return a metric dict with a shared suffix appended to all keys."""
+
+    return {f"{key}{suffix}": value for key, value in values.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a PPO policy on the serve-receive task.")
     parser.add_argument("--task-id", default="TableTennis-SinglePaddleServeReceiveEasy-v0")
@@ -171,8 +177,6 @@ def main() -> None:
     recent_lengths: deque[int] = deque(maxlen=rolling_window)
     recent_successes: deque[float] = deque(maxlen=rolling_window)
     recent_terminal_reasons: deque[str] = deque(maxlen=rolling_window)
-    terminal_reason_counts: defaultdict[str, int] = defaultdict(int)
-
     writer.add_text(
         "algorithm/name",
         "PPO (single-env actor-critic with Gaussian policy, GAE, clipped surrogate objective)",
@@ -289,7 +293,6 @@ def main() -> None:
                         recent_returns.append(current_episode_return)
                         recent_lengths.append(current_episode_length)
                         recent_successes.append(float(success))
-                        terminal_reason_counts[terminal_reason] += 1
                         recent_terminal_reasons.append(terminal_reason)
 
                         record = {
@@ -313,30 +316,19 @@ def main() -> None:
                         metrics_file.flush()
                         print(record)
 
-                        episode_metrics = {
-                            "return": current_episode_return,
-                            "length": current_episode_length,
-                            "success": float(success),
-                            "rolling_return_mean_50": _safe_mean(recent_returns),
-                            "rolling_length_mean_50": _safe_mean(recent_lengths),
-                            "rolling_success_rate_50": _safe_mean(recent_successes),
-                        }
-                        policy_episode_metrics = {
-                            "base_entropy_mean": _safe_mean(current_entropy_values),
-                            "action_std_mean": _safe_mean(current_action_std_values),
-                            "action_abs_mean": _safe_mean(current_action_abs_values),
-                            "action_saturation_frac": _safe_mean(current_action_saturation_values),
-                            "mean_abs": _safe_mean(current_policy_mean_abs_values),
+                        perf_metrics = {
+                            "episode_return": current_episode_return,
+                            "return_mean_50": _safe_mean(recent_returns),
+                            "episode_length_mean_50": _safe_mean(recent_lengths),
+                            "success_rate_50": _safe_mean(recent_successes),
                         }
 
-                        _log_scalars(writer, "episode", episode_metrics, total_steps)
-                        _log_scalars(writer, "policy_episode", policy_episode_metrics, total_steps)
-                        _log_prefixed_items(writer, "episode_reward_terms", current_reward_term_sums, total_steps)
-                        _log_prefixed_items(writer, "terminal_reason_count", terminal_reason_counts, total_steps)
+                        _log_scalars(writer, "Perf", perf_metrics, total_steps)
+                        _log_prefixed_items(writer, "Env/reward", current_reward_term_sums, total_steps)
                         _log_prefixed_items(
                             writer,
-                            "terminal_reason_rate_50",
-                            _rolling_terminal_reason_rates(recent_terminal_reasons),
+                            "Env/termination",
+                            _suffix_keys(_rolling_terminal_reason_rates(recent_terminal_reasons), "_rate_50"),
                             total_steps,
                         )
 
@@ -454,49 +446,31 @@ def main() -> None:
                 steps_per_second = rollout_len / rollout_duration_s
                 train_elapsed_s = max(1e-6, time.perf_counter() - train_wall_start_s)
 
-                optimization_metrics = {
-                    "policy_loss": _safe_mean(policy_loss_values),
-                    "value_loss": _safe_mean(value_loss_values),
-                    "base_policy_entropy_mean": _safe_mean(entropy_loss_values),
-                    "total_loss": _safe_mean(total_loss_values),
-                    "approx_kl": _safe_mean(approx_kl_values),
-                    "clipfrac": _safe_mean(clipfrac_values),
+                loss_metrics = {
+                    "policy": _safe_mean(policy_loss_values),
+                    "value": _safe_mean(value_loss_values),
+                    "entropy": _safe_mean(entropy_loss_values),
+                    "total": _safe_mean(total_loss_values),
+                    "kl": _safe_mean(approx_kl_values),
+                    "clip_fraction": _safe_mean(clipfrac_values),
+                }
+                policy_metrics = {
+                    "entropy_mean": _safe_mean(rollout_entropy_values),
+                    "action_std_mean": _safe_mean(rollout_action_std_values),
+                    "action_saturation_frac": _safe_mean(rollout_action_saturation_values),
+                }
+                train_metrics = {
+                    "mean_step_reward": float(np.mean(reward_buf)),
+                    "fps": steps_per_second,
+                    "done_fraction": float(np.mean(done_buf)),
                     "grad_norm": _safe_mean(grad_norm_values),
-                    "param_norm": param_norm,
                     "explained_variance": explained_variance,
-                    "raw_returns_mean": raw_returns_mean,
-                    "raw_returns_std": raw_returns_std,
-                    "advantage_mean_before_norm": float(adv_mean.detach().cpu()),
-                    "advantage_std_before_norm": float(adv_std.detach().cpu()),
-                    "total_steps": total_steps,
-                    "update_epochs": cfg.update_epochs,
-                    "minibatches_per_epoch": math.ceil(batch_size / minibatch_size),
-                    "early_stop_on_kl": float(early_stop_triggered),
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 }
-                _log_scalars(writer, "optimization", optimization_metrics, update_idx)
-
-                rollout_metrics = {
-                    "reward_sum": float(np.sum(reward_buf)),
-                    "mean_reward": float(np.mean(reward_buf)),
-                    "done_fraction": float(np.mean(done_buf)),
-                    "value_mean": float(np.mean(value_buf)),
-                    "value_std": float(np.std(value_buf)),
-                    "advantage_mean_abs": float(np.mean(np.abs(advantages))),
-                    "base_policy_entropy_mean": _safe_mean(rollout_entropy_values),
-                    "action_std_mean": _safe_mean(rollout_action_std_values),
-                    "action_abs_mean": _safe_mean(rollout_action_abs_values),
-                    "action_saturation_frac": _safe_mean(rollout_action_saturation_values),
-                    "policy_mean_abs": _safe_mean(rollout_policy_mean_abs_values),
-                }
-                system_metrics = {
-                    "steps_per_second": steps_per_second,
-                    "train_elapsed_seconds": train_elapsed_s,
-                    "episodes_completed": episode_idx,
-                }
-                _log_scalars(writer, "rollout", rollout_metrics, update_idx)
-                _log_prefixed_items(writer, "rollout/reward_terms", rollout_reward_term_sums, update_idx)
-                _log_scalars(writer, "system", system_metrics, update_idx)
+                _log_scalars(writer, "Loss", loss_metrics, update_idx)
+                _log_scalars(writer, "Policy", policy_metrics, update_idx)
+                _log_scalars(writer, "Train", train_metrics, update_idx)
+                _log_prefixed_items(writer, "Env/reward_rollout", rollout_reward_term_sums, update_idx)
 
                 while total_steps >= next_checkpoint_step and next_checkpoint_step <= cfg.timesteps:
                     checkpoint_name = f"policy_step_{next_checkpoint_step:08d}.pt"

@@ -118,32 +118,33 @@ class CurriculumCfg:
 
 @dataclass(frozen=True)
 class RewardCfg:
-    survive: float = 0.005
-    tracking_pos: float = 0.10
+    survive: float = 0.0
+    tracking_pos: float = 0.0
     tracking_pos_sigma_m: float = 0.08
-    tracking_rot: float = 0.05
+    tracking_rot: float = 0.0
     tracking_rot_sigma_rad: float = 0.25
-    tracking_vel: float = 0.05
+    tracking_vel: float = 0.0
     tracking_vel_sigma_m_s: float = 1.0
-    legal_hit: float = 2.0
-    send_forward: float = 2.0
+    legal_hit: float = 2.5
+    send_forward: float = 0.30
     send_forward_min_speed_m_s: float = 0.80
     send_forward_scale_m_s: float = 3.0
-    lift: float = 0.20
+    lift: float = 0.10
     lift_min_m_s: float = 0.20
     lift_scale_m_s: float = 1.0
-    cross_net: float = 3.0
-    landing: float = 10.0
-    landing_shape: float = 0.80
+    outgoing_direction: float = 0.10
+    cross_net: float = 5.0
+    landing: float = 2.0
+    landing_shape: float = 0.0
     landing_sigma_m: float = 0.35
-    action_rate_penalty: float = 0.004
-    action_mag_penalty: float = 0.001
-    qvel_penalty: float = 0.0003
-    floor_penalty: float = -3.0
-    double_bounce_penalty: float = -3.0
+    action_rate_penalty: float = 0.001
+    action_mag_penalty: float = 0.0005
+    qvel_penalty: float = 0.0
+    floor_penalty: float = -2.0
+    double_bounce_penalty: float = -2.0
     multi_hit_penalty: float = -2.0
-    wrong_landing_penalty: float = -2.0
-    net_fail_penalty: float = -2.0
+    wrong_landing_penalty: float = -1.0
+    net_fail_penalty: float = -3.0
     out_of_bounds_penalty: float = -2.0
 
 
