@@ -20,6 +20,7 @@ class ControlBackend:
 
     control_cfg: ControlCfg
     actuator_ids: tuple[int, ...]
+    linear_offset_m: np.ndarray
 
     def apply(
         self,
@@ -55,6 +56,20 @@ class ControlBackend:
             raise ValueError(f"Unsupported control_mode: {mode}")
 
         return self._clip_and_write(target, data)
+
+    def task_to_model_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Convert task/world paddle coordinates into MuJoCo joint coordinates."""
+
+        mapped = np.asarray(qpos, dtype=np.float64).copy()
+        mapped[:3] -= self.linear_offset_m
+        return mapped
+
+    def model_to_task_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Convert MuJoCo joint coordinates back into task/world coordinates."""
+
+        mapped = np.asarray(qpos, dtype=np.float64).copy()
+        mapped[:3] += self.linear_offset_m
+        return mapped
 
     def _scale_pose_delta(
         self,
@@ -95,5 +110,7 @@ class ControlBackend:
         clipped = np.asarray(target, dtype=np.float64).copy()
         for i, (lower, upper) in enumerate(limits):
             clipped[i] = float(np.clip(clipped[i], lower, upper))
-            data.ctrl[self.actuator_ids[i]] = clipped[i]
+        model_qpos = self.task_to_model_qpos(clipped)
+        for i, actuator_id in enumerate(self.actuator_ids):
+            data.ctrl[actuator_id] = model_qpos[i]
         return clipped

@@ -174,3 +174,21 @@ def paddle_normal_from_xmat(xmat: np.ndarray) -> np.ndarray:
 
     mat = np.asarray(xmat, dtype=np.float64).reshape(3, 3)
     return normalize(mat[:, 1])
+
+
+def paddle_normal_from_euler(euler: np.ndarray) -> np.ndarray:
+    """Approximate the paddle-face normal from the planner Euler convention."""
+
+    roll, pitch, yaw = np.asarray(euler, dtype=np.float64)
+    del roll
+    cos_pitch = float(np.cos(pitch))
+    return normalize(
+        np.array(
+            [
+                -float(np.sin(yaw)) * cos_pitch,
+                float(np.cos(yaw)) * cos_pitch,
+                float(np.sin(pitch)),
+            ],
+            dtype=np.float64,
+        )
+    )

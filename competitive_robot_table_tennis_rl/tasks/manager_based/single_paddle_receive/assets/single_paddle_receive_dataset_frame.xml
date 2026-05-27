@@ -166,8 +166,8 @@
 
   <actuator>
     <position name="paddle_x_pos" joint="paddle_x" kp="500" ctrlrange="-0.60 0.60" class="paddle_motor" forcerange="-250 250"/>
-    <position name="paddle_y_pos" joint="paddle_y" kp="500" ctrlrange="-1.25 -0.05" class="paddle_motor" forcerange="-250 250"/>
-    <position name="paddle_z_pos" joint="paddle_z" kp="600" ctrlrange="0.05 0.60" class="paddle_motor" forcerange="-300 300"/>
+    <position name="paddle_y_pos" joint="paddle_y" kp="500" ctrlrange="-1.25 -0.15" class="paddle_motor" forcerange="-250 250"/>
+    <position name="paddle_z_pos" joint="paddle_z" kp="600" ctrlrange="0.1 0.60" class="paddle_motor" forcerange="-300 300"/>
     <position name="paddle_roll_pos" joint="paddle_roll" kp="80" ctrlrange="-3.15 3.15" class="paddle_motor" forcerange="-40 40"/>
     <position name="paddle_pitch_pos" joint="paddle_pitch" kp="80" ctrlrange="-3.15 3.15" class="paddle_motor" forcerange="-40 40"/>
     <position name="paddle_yaw_pos" joint="paddle_yaw" kp="80" ctrlrange="-3.15 3.15" class="paddle_motor" forcerange="-40 40"/>

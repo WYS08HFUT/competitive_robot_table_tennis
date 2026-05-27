@@ -32,7 +32,7 @@ from .mdp.transforms import (
     point_on_own_side,
     predict_ballistic_landing,
 )
-from .planning import BallPredictor, HitPlan, ImpactPlanner, PaddlePathPlanner
+from .planning import BallPredictor, HitPlan, ImpactPlanner, PaddlePathPlanner, should_reset_hit_plan
 from .utils.paths import resolve_repo_path
 from .utils.serve_dataset import ServeSample, filter_serves, load_serves
 
@@ -98,7 +98,13 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
             "paddle_yaw_pos",
         )
         actuator_ids = tuple(self._name_to_id(mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in actuator_names)
-        self.control_backend = ControlBackend(control_cfg=self.cfg.control, actuator_ids=actuator_ids)
+        paddle_root_body_id = int(self.model.jnt_bodyid[self.paddle_joint_ids[0]])
+        paddle_linear_offset_m = np.asarray(self.model.body_pos[paddle_root_body_id], dtype=np.float64).copy()
+        self.control_backend = ControlBackend(
+            control_cfg=self.cfg.control,
+            actuator_ids=actuator_ids,
+            linear_offset_m=paddle_linear_offset_m,
+        )
 
         self.serves = load_serves(self.cfg.dataset.serves_path)
         self.serve_by_id = {sample.id: sample for sample in self.serves}
@@ -144,16 +150,19 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
         self.episode_time_s = 0.0
         self.step_count = 0
         self.last_info: dict[str, Any] = {}
-        self.ball_predictor = BallPredictor(DEFAULT_GRAVITY_M_S2)
+        self.ball_predictor = BallPredictor(
+            DEFAULT_GRAVITY_M_S2,
+            table_bounce_restitution_z=self.cfg.dataset.table_bounce_restitution_z,
+            table_bounce_damping_xy=self.cfg.dataset.table_bounce_damping_xy,
+        )
         self.impact_planner = ImpactPlanner(
             self.cfg.planner,
             self.cfg.control,
             ball_predictor=self.ball_predictor,
         )
         self.path_planner = PaddlePathPlanner(
-            home_qpos=np.array(self.cfg.control.home_qpos, dtype=np.float64),
-            follow_through_time_s=self.cfg.planner.follow_through_time_s,
-            follow_through_distance_m=self.cfg.planner.follow_through_distance_m,
+            control_cfg=self.cfg.control,
+            planner_cfg=self.cfg.planner,
         )
 
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.cfg.action_dim,), dtype=np.float32)
@@ -309,7 +318,7 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
 
     @property
     def paddle_qpos(self) -> np.ndarray:
-        return self.data.qpos[self.paddle_joint_qpos_adr].copy()
+        return self.control_backend.model_to_task_qpos(self.data.qpos[self.paddle_joint_qpos_adr])
 
     @property
     def paddle_qvel(self) -> np.ndarray:
@@ -330,8 +339,9 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
         return int(obj_id)
 
     def _set_paddle_pose(self, qpos: np.ndarray) -> None:
-        self.data.qpos[self.paddle_joint_qpos_adr] = qpos
-        for actuator_id, target in zip(self.control_backend.actuator_ids, qpos):
+        model_qpos = self.control_backend.task_to_model_qpos(qpos)
+        self.data.qpos[self.paddle_joint_qpos_adr] = model_qpos
+        for actuator_id, target in zip(self.control_backend.actuator_ids, model_qpos):
             self.data.ctrl[actuator_id] = target
 
     def _sample_target_landing_xy(self, options: dict[str, Any]) -> np.ndarray:
@@ -398,8 +408,9 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
                 ball_vel=self.ball_vel,
                 paddle_qpos=self.paddle_qpos,
                 target_landing_xy=self.target_landing_xy,
+                bounce_has_occurred=self.state.own_side_bounce_count > 0,
             )
-            if self._should_reset_hit_plan(new_plan, force=reset_path):
+            if self._should_reset_hit_plan(new_plan, force=reset_path, now_s=self.episode_time_s):
                 self.current_hit_plan = new_plan
                 self.path_planner.reset(
                     current_qpos=self.paddle_qpos,
@@ -412,19 +423,15 @@ class SinglePaddleServeReceiveEnv(gym.Env[np.ndarray, np.ndarray]):
         self.current_nominal_cmd_qvel = command.qvel.copy()
         self._update_runtime_planner_state(self.current_hit_plan, command.qpos, command.qvel)
 
-    def _should_reset_hit_plan(self, new_plan: HitPlan, *, force: bool) -> bool:
-        if force:
-            return True
-        if self.state.has_hit:
-            return False
-        if self.current_hit_plan.valid != new_plan.valid:
-            return True
-        if not new_plan.valid:
-            return False
-        hit_pos_delta = float(np.linalg.norm(new_plan.hit_pos - self.current_hit_plan.hit_pos))
-        hit_euler_delta = float(np.linalg.norm(self._wrapped_euler_delta(new_plan.hit_euler - self.current_hit_plan.hit_euler)))
-        hit_time_delta = abs(float(new_plan.hit_time_s - self.current_hit_plan.hit_time_s))
-        return hit_pos_delta > 0.05 or hit_euler_delta > 0.20 or hit_time_delta > 0.10
+    def _should_reset_hit_plan(self, new_plan: HitPlan, *, force: bool, now_s: float) -> bool:
+        return should_reset_hit_plan(
+            current_hit_plan=self.current_hit_plan,
+            new_hit_plan=new_plan,
+            force=force,
+            has_hit=self.state.has_hit,
+            now_s=now_s,
+            path_planner=self.path_planner,
+        )
 
     def _update_runtime_planner_state(
         self,

@@ -12,6 +12,7 @@ TABLE_TOP_Z_M = 0.0
 NET_HEIGHT_M = 0.1525
 NET_HALF_WIDTH_M = 0.915
 BALL_RADIUS_M = 0.02
+PADDLE_CONTACT_HALF_THICKNESS_M = 0.01
 DEFAULT_GRAVITY_M_S2 = 9.81
 
 
@@ -55,8 +56,8 @@ class ControlCfg:
     residual_scale_m: tuple[float, float, float] = (0.08, 0.08, 0.08)
     residual_scale_rad: tuple[float, float, float] = (0.25, 0.25, 0.25)
     x_range_m: tuple[float, float] = (-0.60, 0.60)
-    y_range_m: tuple[float, float] = (-1.25, -0.05)
-    z_range_m: tuple[float, float] = (0.05, 0.60)
+    y_range_m: tuple[float, float] = (-1.25, -0.15)
+    z_range_m: tuple[float, float] = (0.1, 0.60)
     roll_range_rad: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
     pitch_range_rad: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
     yaw_range_rad: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
@@ -85,6 +86,15 @@ class PlannerCfg:
     max_outgoing_speed_m_s: float = 8.0
     follow_through_time_s: float = 0.15
     follow_through_distance_m: float = 0.08
+    apf_integration_dt_s: float = 0.01
+    apf_stage_standoff_m: float = 0.10
+    apf_stage_release_time_s: float = 0.12
+    apf_linear_gain: float = 10.0
+    apf_angular_gain: float = 12.0
+    apf_linear_max_speed_m_s: float = 3.0
+    apf_angular_max_speed_rad_s: float = 8.0
+    apf_boundary_margin_m: float = 0.05
+    apf_boundary_repulsion_gain: float = 0.0015
 
 
 @dataclass(frozen=True)

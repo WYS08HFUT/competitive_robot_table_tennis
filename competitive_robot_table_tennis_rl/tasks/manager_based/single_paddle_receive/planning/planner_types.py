@@ -22,8 +22,10 @@ class HitPlan:
 
     valid: bool
     hit_time_s: float
+    ball_hit_pos: np.ndarray
     hit_pos: np.ndarray
     hit_euler: np.ndarray
+    incoming_ball_vel: np.ndarray
     hit_vel: np.ndarray
     outgoing_vel_des: np.ndarray
     target_landing_xy: np.ndarray
@@ -42,8 +44,10 @@ class HitPlan:
         return cls(
             valid=False,
             hit_time_s=0.0,
+            ball_hit_pos=zeros3.copy(),
             hit_pos=zeros3.copy(),
             hit_euler=zeros3.copy(),
+            incoming_ball_vel=zeros3.copy(),
             hit_vel=zeros3.copy(),
             outgoing_vel_des=zeros3.copy(),
             target_landing_xy=landing_xy,
